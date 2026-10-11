@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibe-proofread — local LLM proofreader</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --ink:#e8ecf4; --dim:#9aa4b8;
+          --add:#3ddc84; --del:#ff6b6b; --accent:#6ea8fe; --line:#2a3450; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 80px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin:0 0 20px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:900px){ .grid{grid-template-columns:1fr} }
+  textarea { width:100%; min-height:260px; background:var(--panel); color:var(--ink);
+             border:1px solid var(--line); border-radius:8px; padding:12px; font:inherit; resize:vertical; }
+  .out { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+         padding:12px; min-height:260px; white-space:pre-wrap; }
+  .edit { border-bottom:1px dashed var(--line); padding:6px 4px; }
+  .edit s { color:var(--del); }
+  .edit .rep { color:var(--add); }
+  .edit .why { color:var(--dim); font-size:12px; display:block; }
+  .edit button { font-size:12px; margin-right:6px; }
+  button { background:var(--accent); color:#0b1020; border:0; border-radius:6px;
+           padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  .bar { display:flex; gap:8px; align-items:center; margin:12px 0; flex-wrap:wrap; }
+  details { margin:12px 0; }
+  label { display:block; font-size:12px; color:var(--dim); margin-top:8px; }
+  input, select { width:100%; background:var(--panel); color:var(--ink); border:1px solid var(--line);
+                  border-radius:6px; padding:7px; font:inherit; }
+  .status { color:var(--dim); font-size:13px; }
+  .err { color:var(--del); }
+</style>
+</head>
+<body>
+<main>
+  <h1>vibe-proofread</h1>
+  <p class="sub">Grammarly-style inline proofreading against any OpenAI-compatible LLM
+     (LM Studio default). Your text never leaves the machine.</p>
+
+  <details>
+    <summary>Settings</summary>
+    <label>Endpoint (OpenAI-compatible /v1 base URL)</label>
+    <input id="endpoint" value="http://127.0.0.1:1234/v1">
+    <label>Model</label>
+    <input id="model" value="local-model">
+    <label>API key (optional — leave blank for local)</label>
+    <input id="apikey" type="password" placeholder="sk-...">
+  </details>
+
+  <div class="grid">
+    <div>
+      <textarea id="src" placeholder="Paste text to proofread…"></textarea>
+      <div class="bar">
+        <button id="go">Proofread</button>
+        <button id="apply" class="ghost" disabled>Apply accepted → copy</button>
+        <span id="status" class="status"></span>
+      </div>
+    </div>
+    <div>
+      <div class="out" id="review"><span class="status">Edits will appear here.</span></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+["endpoint","model"].forEach(k => $(k).value = localStorage["vp_"+k] ?? $(k).value);
+$("apikey").value = localStorage.vp_apikey ?? "";
+["endpoint","model","apikey"].forEach(k => $(k).onchange = () => localStorage["vp_"+k] = $(k).value);
+
+const SYSTEM = `You are a strict proofreader, not a ghostwriter. Return ONLY valid JSON:
+{"edits":[{"original":"<exact substring from the text>","replacement":"<corrected text>","reason":"<why, <12 words>","type":"grammar|spelling|punctuation|style|clarity"}]}
+Rules: fix objective errors (grammar, spelling, punctuation, agreement, tense) and flag
+genuinely unclear phrasing. Do NOT rewrite for voice, do NOT add or remove meaning,
+do NOT restyle correct text. "original" must be a verbatim substring of the input.
+If the text is clean, return {"edits":[]}.`;
+
+let edits = [];
+
+$("go").onclick = async () => {
+  const text = $("src").value;
+  if (!text.trim()) return;
+  $("go").disabled = true; $("apply").disabled = true;
+  $("status").textContent = "Proofreading…"; $("status").className = "status";
+  try {
+    const res = await fetch($("endpoint").value.replace(/\/$/,"") + "/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 ...($("apikey").value ? {Authorization: "Bearer " + $("apikey").value} : {}) },
+      body: JSON.stringify({
+        model: $("model").value, temperature: 0,
+        messages: [{role:"system", content:SYSTEM}, {role:"user", content:text}],
+        response_format: {type: "json_object"}
+      })
+    });
+    if (!res.ok) throw new Error(res.status + " " + await res.text());
+    const data = await res.json();
+    const raw = data.choices[0].message.content;
+    edits = parseEdits(raw, text);
+    render(text);
+    $("status").textContent = edits.length ? `${edits.length} suggestion(s)` : "Clean — no edits.";
+  } catch (e) {
+    $("status").textContent = "Error: " + e.message; $("status").className = "status err";
+  }
+  $("go").disabled = false;
+};
+
+function parseEdits(raw, text) {
+  let obj;
+  try { obj = JSON.parse(raw); }
+  catch { const m = raw.match(/\{[\s\S]*\}/); obj = m ? JSON.parse(m[0]) : {edits:[]}; }
+  // Keep only edits whose `original` is a verbatim substring, first occurrence wins.
+  const seen = new Set(), out = [];
+  for (const e of obj.edits ?? []) {
+    if (!e.original || typeof e.replacement !== "string") continue;
+    const at = text.indexOf(e.original);
+    if (at < 0 || seen.has(at)) continue;
+    seen.add(at);
+    out.push({...e, at, accepted: true, rejected: false});
+  }
+  return out.sort((a,b) => a.at - b.at);
+}
+
+function render(text) {
+  const box = $("review"); box.innerHTML = "";
+  if (!edits.length) { box.innerHTML = '<span class="status">No suggestions.</span>'; return; }
+  edits.forEach((e, i) => {
+    const d = document.createElement("div"); d.className = "edit"; d.id = "e"+i;
+    d.innerHTML = `<s></s> → <span class="rep"></span>
+      <span class="why"></span>
+      <button class="ghost" data-a="keep">Revert</button>
+      <button class="ghost" data-a="drop">Ignore</button>`;
+    d.querySelector("s").textContent = e.original;
+    d.querySelector(".rep").textContent = e.replacement;
+    d.querySelector(".why").textContent = `${e.type ?? "edit"} — ${e.reason ?? ""}`;
+    d.querySelector('[data-a="keep"]').onclick = () => { e.rejected = false; e.accepted = true; refresh(i); };
+    d.querySelector('[data-a="drop"]').onclick = () => { e.rejected = true; e.accepted = false; refresh(i); };
+    box.appendChild(d);
+  });
+  $("apply").disabled = false;
+}
+
+function refresh(i) { $("e"+i).style.opacity = edits[i].rejected ? .4 : 1; }
+
+$("apply").onclick = async () => {
+  // Apply non-overlapping accepted edits right-to-left.
+  const acc = edits.filter(e => e.accepted && !e.rejected)
+                   .sort((a,b) => b.at - a.at);
+  let out = $("src").value;
+  for (const e of acc) out = out.slice(0, e.at) + e.replacement + out.slice(e.at + e.original.length);
+  $("src").value = out;
+  try { await navigator.clipboard.writeText(out); $("status").textContent = "Applied + copied."; }
+  catch { $("status").textContent = "Applied (clipboard blocked — copy manually)."; }
+};
+</script>
+</body>
+</html>

@@ -23,3 +23,8 @@ No build, no tests, no dependencies.
   hardcoded. Never commit secrets.
 - All edits must be verified against the source text verbatim
   (`parseEdits` drops non-substring hallucinations) — do not weaken that.
+- **Don't trust, verify** — post-edit lint hook runs automatically
+  (`.claude/hooks/post_edit_lint.py`); findings are defects, fix them.
+  Never claim done without a command that proves it (`verify-change` skill).
+- **Automate the annoying stuff** — a process explained twice becomes a
+  hook, a `scripts/` tool, or a `.devin/skills/` entry.

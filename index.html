@@ -70,8 +70,9 @@
 <script>
 const $ = id => document.getElementById(id);
 ["endpoint","model"].forEach(k => $(k).value = localStorage["vp_"+k] ?? $(k).value);
-$("apikey").value = localStorage.vp_apikey ?? "";
-["endpoint","model","apikey"].forEach(k => $(k).onchange = () => localStorage["vp_"+k] = $(k).value);
+$("apikey").value = sessionStorage.vp_apikey ?? "";
+["endpoint","model"].forEach(k => $(k).onchange = () => localStorage["vp_"+k] = $(k).value);
+$("apikey").onchange = () => sessionStorage.vp_apikey = $("apikey").value;
 
 const SYSTEM = `You are a strict proofreader, not a ghostwriter. Return ONLY valid JSON:
 {"edits":[{"original":"<exact substring from the text>","replacement":"<corrected text>","reason":"<why, <12 words>","type":"grammar|spelling|punctuation|style|clarity"}]}
@@ -89,8 +90,15 @@ $("go").onclick = async () => {
   $("go").disabled = true; $("apply").disabled = true;
   $("status").textContent = "Proofreading…"; $("status").className = "status";
   try {
-    const res = await fetch($("endpoint").value.replace(/\/$/,"") + "/chat/completions", {
+    const ep = $("endpoint").value.replace(/\/$/,"");
+    // Warn when the endpoint is plaintext http to a non-local host — the
+    // request carries the Bearer key and document text unencrypted.
+    const epHost = new URL(ep).hostname;
+    if (ep.startsWith("http:") && !["localhost","127.0.0.1","::1"].includes(epHost))
+      $("status").textContent = "Warning: http:// endpoint — key and text sent unencrypted.";
+    const res = await fetch(ep + "/chat/completions", {
       method: "POST",
+      signal: AbortSignal.timeout(60000),
       headers: { "Content-Type": "application/json",
                  ...($("apikey").value ? {Authorization: "Bearer " + $("apikey").value} : {}) },
       body: JSON.stringify({
@@ -131,7 +139,10 @@ function parseEdits(raw, text) {
     if (taken.some(([s, t]) => at < t && end > s)) continue;
     taken.push([at, end]);
     cursor = Math.max(cursor, end);
-    out.push({...e, at, accepted: true, rejected: false});
+    // Replacements carrying markup or URLs are suspect — a proofreader has no
+    // business injecting links or tags. Surface them but don't auto-accept.
+    const suspect = /[<>]|https?:\/\//.test(e.replacement);
+    out.push({...e, at, accepted: !suspect, rejected: suspect});
   }
   return out.sort((a,b) => a.at - b.at);
 }
@@ -147,10 +158,12 @@ function render(text) {
       <button class="ghost" data-a="drop">Ignore</button>`;
     d.querySelector("s").textContent = e.original;
     d.querySelector(".rep").textContent = e.replacement;
-    d.querySelector(".why").textContent = `${e.type ?? "edit"} — ${e.reason ?? ""}`;
+    d.querySelector(".why").textContent = `${e.type ?? "edit"} — ${e.reason ?? ""}` +
+      (e.rejected ? " (contains markup/URL — not auto-applied)" : "");
     d.querySelector('[data-a="keep"]').onclick = () => { e.rejected = false; e.accepted = true; refresh(i); };
     d.querySelector('[data-a="drop"]').onclick = () => { e.rejected = true; e.accepted = false; refresh(i); };
     box.appendChild(d);
+    refresh(i);
   });
   $("apply").disabled = false;
 }

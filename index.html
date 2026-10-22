@@ -70,8 +70,9 @@
 <script>
 const $ = id => document.getElementById(id);
 ["endpoint","model"].forEach(k => $(k).value = localStorage["vp_"+k] ?? $(k).value);
-$("apikey").value = localStorage.vp_apikey ?? "";
-["endpoint","model","apikey"].forEach(k => $(k).onchange = () => localStorage["vp_"+k] = $(k).value);
+$("apikey").value = sessionStorage.vp_apikey ?? "";
+["endpoint","model"].forEach(k => $(k).onchange = () => localStorage["vp_"+k] = $(k).value);
+$("apikey").onchange = () => sessionStorage.vp_apikey = $("apikey").value;
 
 const SYSTEM = `You are a strict proofreader, not a ghostwriter. Return ONLY valid JSON:
 {"edits":[{"original":"<exact substring from the text>","replacement":"<corrected text>","reason":"<why, <12 words>","type":"grammar|spelling|punctuation|style|clarity"}]}
@@ -81,6 +82,7 @@ do NOT restyle correct text. "original" must be a verbatim substring of the inpu
 If the text is clean, return {"edits":[]}.`;
 
 let edits = [];
+let baseText = "";  // snapshot of `src` at proofread time; offsets are relative to it
 
 $("go").onclick = async () => {
   const text = $("src").value;
@@ -88,8 +90,15 @@ $("go").onclick = async () => {
   $("go").disabled = true; $("apply").disabled = true;
   $("status").textContent = "Proofreading…"; $("status").className = "status";
   try {
-    const res = await fetch($("endpoint").value.replace(/\/$/,"") + "/chat/completions", {
+    const ep = $("endpoint").value.replace(/\/$/,"");
+    // Warn when the endpoint is plaintext http to a non-local host — the
+    // request carries the Bearer key and document text unencrypted.
+    const epHost = new URL(ep).hostname;
+    if (ep.startsWith("http:") && !["localhost","127.0.0.1","::1"].includes(epHost))
+      $("status").textContent = "Warning: http:// endpoint — key and text sent unencrypted.";
+    const res = await fetch(ep + "/chat/completions", {
       method: "POST",
+      signal: AbortSignal.timeout(60000),
       headers: { "Content-Type": "application/json",
                  ...($("apikey").value ? {Authorization: "Bearer " + $("apikey").value} : {}) },
       body: JSON.stringify({
@@ -102,6 +111,7 @@ $("go").onclick = async () => {
     const data = await res.json();
     const raw = data.choices[0].message.content;
     edits = parseEdits(raw, text);
+    baseText = text;
     render(text);
     $("status").textContent = edits.length ? `${edits.length} suggestion(s)` : "Clean — no edits.";
   } catch (e) {
@@ -114,14 +124,25 @@ function parseEdits(raw, text) {
   let obj;
   try { obj = JSON.parse(raw); }
   catch { const m = raw.match(/\{[\s\S]*\}/); obj = m ? JSON.parse(m[0]) : {edits:[]}; }
-  // Keep only edits whose `original` is a verbatim substring, first occurrence wins.
-  const seen = new Set(), out = [];
+  // Keep only edits whose `original` is a verbatim, non-overlapping substring.
+  // Search forward from a cursor so repeated phrases match in order;
+  // fall back to a full scan for out-of-order edits, then reject overlaps.
+  const taken = [], out = [];
+  let cursor = 0;
   for (const e of obj.edits ?? []) {
-    if (!e.original || typeof e.replacement !== "string") continue;
-    const at = text.indexOf(e.original);
-    if (at < 0 || seen.has(at)) continue;
-    seen.add(at);
-    out.push({...e, at, accepted: true, rejected: false});
+    if (typeof e.original !== "string" || !e.original ||
+        typeof e.replacement !== "string") continue;
+    let at = text.indexOf(e.original, cursor);
+    if (at < 0) at = text.indexOf(e.original);
+    if (at < 0) continue;
+    const end = at + e.original.length;
+    if (taken.some(([s, t]) => at < t && end > s)) continue;
+    taken.push([at, end]);
+    cursor = Math.max(cursor, end);
+    // Replacements carrying markup or URLs are suspect — a proofreader has no
+    // business injecting links or tags. Surface them but don't auto-accept.
+    const suspect = /[<>]|https?:\/\//.test(e.replacement);
+    out.push({...e, at, accepted: !suspect, rejected: suspect});
   }
   return out.sort((a,b) => a.at - b.at);
 }
@@ -137,10 +158,12 @@ function render(text) {
       <button class="ghost" data-a="drop">Ignore</button>`;
     d.querySelector("s").textContent = e.original;
     d.querySelector(".rep").textContent = e.replacement;
-    d.querySelector(".why").textContent = `${e.type ?? "edit"} — ${e.reason ?? ""}`;
+    d.querySelector(".why").textContent = `${e.type ?? "edit"} — ${e.reason ?? ""}` +
+      (e.rejected ? " (contains markup/URL — not auto-applied)" : "");
     d.querySelector('[data-a="keep"]').onclick = () => { e.rejected = false; e.accepted = true; refresh(i); };
     d.querySelector('[data-a="drop"]').onclick = () => { e.rejected = true; e.accepted = false; refresh(i); };
     box.appendChild(d);
+    refresh(i);
   });
   $("apply").disabled = false;
 }
@@ -148,14 +171,26 @@ function render(text) {
 function refresh(i) { $("e"+i).style.opacity = edits[i].rejected ? .4 : 1; }
 
 $("apply").onclick = async () => {
-  // Apply non-overlapping accepted edits right-to-left.
-  const acc = edits.filter(e => e.accepted && !e.rejected)
-                   .sort((a,b) => b.at - a.at);
-  let out = $("src").value;
-  for (const e of acc) out = out.slice(0, e.at) + e.replacement + out.slice(e.at + e.original.length);
+  // Offsets were computed against `baseText`. If the textarea changed since
+  // proofread, re-locate each `original` in the live text and verify the
+  // splice target verbatim — never splice a stale offset blind.
+  const live = $("src").value;
+  const shifted = live !== baseText;
+  let skipped = 0;
+  const acc = [];
+  for (const e of edits.filter(e => e.accepted && !e.rejected)) {
+    const at = shifted ? live.indexOf(e.original) : e.at;
+    if (at < 0 || live.slice(at, at + e.original.length) !== e.original) { skipped++; continue; }
+    acc.push({e, at});
+  }
+  acc.sort((a,b) => b.at - a.at);  // right-to-left so earlier offsets stay valid
+  let out = live;
+  for (const {e, at} of acc)
+    out = out.slice(0, at) + e.replacement + out.slice(at + e.original.length);
   $("src").value = out;
-  try { await navigator.clipboard.writeText(out); $("status").textContent = "Applied + copied."; }
-  catch { $("status").textContent = "Applied (clipboard blocked — copy manually)."; }
+  const note = skipped ? ` (${skipped} stale edit(s) skipped)` : "";
+  try { await navigator.clipboard.writeText(out); $("status").textContent = "Applied + copied." + note; }
+  catch { $("status").textContent = "Applied (clipboard blocked — copy manually)." + note; }
 };
 </script>
 </body>
